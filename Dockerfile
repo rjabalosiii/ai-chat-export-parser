@@ -1,11 +1,12 @@
-FROM mcr.microsoft.com/playwright:v1.47.0-jammy
+# Match Playwright version to the NPM dependency (1.54.2)
+FROM mcr.microsoft.com/playwright:v1.54.2-jammy
 
 WORKDIR /app
 
-# Copy only package metadata first (no lockfile required)
+# Copy package metadata (no lockfile required)
 COPY package*.json ./
 
-# Install dependencies (production only, no lockfile needed)
+# Install only production deps
 RUN npm install --omit=dev
 
 # Copy app source
