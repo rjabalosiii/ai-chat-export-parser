@@ -54,4 +54,227 @@ function extractFromEmbeddedJSON(html) {
     const el = $(sel).first();
     if (!el.length) continue;
     try {
-      const json = JSON.par
+      const json = JSON.parse(el.text());
+      const paths = [
+        ["props", "pageProps", "serverResponse", "messages"],
+        ["props", "pageProps", "sharedConversation", "mapping"],
+        ["state", "conversation", "messages"],
+        ["messages"]
+      ];
+      for (const p of paths) {
+        let node = json;
+        for (const k of p) node = node?.[k];
+        if (!node) continue;
+
+        const turns = [];
+        if (Array.isArray(node)) {
+          for (const m of node) {
+            const role = m?.author?.role || m?.role;
+            const parts = m?.content?.parts;
+            const text = Array.isArray(parts) ? parts.join("\n\n") : m?.content?.text || m?.content || "";
+            if (role && text) turns.push({ role, content: clean(String(text)) });
+          }
+        } else {
+          for (const v of Object.values(node)) {
+            const msg = v?.message || v;
+            const role = msg?.author?.role || msg?.role;
+            const parts = msg?.content?.parts;
+            const text = Array.isArray(parts) ? parts.join("\n\n") : msg?.content?.text || msg?.content || "";
+            if (role && text) turns.push({ role, content: clean(String(text)) });
+          }
+        }
+        if (turns.length) return { title: metaTitle($), model: metaModel($), turns };
+      }
+    } catch {}
+  }
+  return null;
+}
+
+/* 2) Hydrated DOM parse (no JS) */
+function extractFromDomHTML(html) {
+  const $ = cheerio.load(html);
+  const nodes = $("[data-message-author-role]");
+  if (!nodes.length) return null;
+
+  const turns = [];
+  nodes.each((_, el) => {
+    const role = $(el).attr("data-message-author-role") || "assistant";
+
+    // keep code blocks as fenced Markdown
+    $(el).find("pre").each((__, pre) => {
+      const code = $(pre).text();
+      $(pre).replaceWith("```" + "\n" + code + "\n" + "```");
+    });
+
+    const text = clean($(el).text());
+    if (text) turns.push({ role, content: text });
+  });
+  if (!turns.length) return null;
+  return { title: metaTitle($), model: metaModel($), turns };
+}
+
+/* 3) Playwright render */
+async function extractWithPlaywright(url) {
+  const browser = await chromium.launch({ args: ["--no-sandbox"] });
+  try {
+    const page = await browser.newPage();
+    await page.goto(url, { waitUntil: "networkidle", timeout: TIMEOUT_MS });
+    await page.waitForTimeout(800);
+
+    // try DOM after hydration
+    const html = await page.content();
+    const dom = extractFromDomHTML(html);
+    if (dom) return dom;
+
+    // evaluate in-page to convert <pre> into fenced blocks
+    const data = await page.evaluate(() => {
+      const items = Array.from(document.querySelectorAll("[data-message-author-role]"));
+      if (!items.length) return null;
+      items.forEach(el => {
+        el.querySelectorAll("pre").forEach(pre => {
+          const txt = pre.textContent || "";
+          const div = document.createElement("div");
+          div.textContent = "```" + "\n" + txt + "\n" + "```";
+          pre.replaceWith(div);
+        });
+      });
+      const turns = items
+        .map(el => ({
+          role: el.getAttribute("data-message-author-role") || "assistant",
+          content: (el.textContent || "").trim()
+        }))
+        .filter(t => t.content);
+      const title =
+        document.querySelector('meta[property="og:title"]')?.getAttribute("content") ||
+        document.title ||
+        "Conversation";
+      const model = document.querySelector('meta[name="model"]')?.getAttribute("content") || null;
+      return { title, model, turns };
+    });
+    if (data?.turns?.length) return data;
+    return null;
+  } finally {
+    await browser.close();
+  }
+}
+
+/* ---------------- routes ---------------- */
+app.get("/", (_req, res) => {
+  res.type("text/plain").send("AI Chat Export Parser is running. Try /healthz or /api/ingest?url=...");
+});
+
+app.get("/healthz", (_req, res) => res.json({ ok: true, ts: nowIso() }));
+
+app.get("/api/ingest", async (req, res) => {
+  try {
+    const url = String(req.query.url || "");
+    if (!url) return res.status(400).json({ error: "url required" });
+    if (!isChatGPT(url)) return res.status(400).json({ error: "only chatgpt share links supported" });
+
+    let parsed = null;
+
+    // --- 1) Try static fetch first with browser-like headers ---
+    if (!FORCE_PLAYWRIGHT) {
+      try {
+        const r = await fetch(url, {
+          headers: {
+            "User-Agent": ua,
+            "Accept":
+              "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-User": "?1",
+            "Sec-Fetch-Dest": "document"
+          }
+        });
+
+        if (r.ok) {
+          const html = await r.text();
+          parsed = extractFromEmbeddedJSON(html) || extractFromDomHTML(html);
+        } else if (![403, 401, 503].includes(r.status)) {
+          // not a “blocked” code — return specific error
+          return res.status(422).json({ error: `fetch ${r.status}` });
+        }
+      } catch {
+        // ignore; we’ll try Playwright next
+      }
+    }
+
+    // --- 2) If static parse failed/blocked, use Playwright ---
+    if (!parsed) {
+      parsed = await extractWithPlaywright(url);
+    }
+
+    if (!parsed?.turns?.length) {
+      return res.status(422).json({ error: "parse_failed", hint: "try manual paste" });
+    }
+
+    return res.json({
+      title: parsed.title || "Conversation",
+      model: parsed.model || null,
+      source: "chatgpt",
+      canonical_url: url,
+      fetched_at: nowIso(),
+      turns: parsed.turns.map((t, i) => ({ role: t.role, content: t.content, ord: i }))
+    });
+  } catch (e) {
+    return res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+/* --------- PDF endpoint (HTML -> PDF via Playwright) --------- */
+app.post("/api/pdf", async (req, res) => {
+  try {
+    const { title, turns } = req.body || {};
+    if (!title || !Array.isArray(turns)) {
+      return res.status(400).json({ error: "title and turns required" });
+    }
+
+    const escapeHtml = s =>
+      String(s).replace(/[&<>"']/g, m => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m]));
+    const formatRich = text =>
+      String(text)
+        .replace(/```([\s\S]*?)```/g, (_m, code) => `<pre><code>${escapeHtml(code)}</code></pre>`)
+        .replace(/\n/g, "<br/>");
+    const slug = s => (s || "conversation").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
+
+    const html = `<!doctype html><html><head><meta charset="utf-8"><style>
+@page { margin: 22mm; }
+body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; color:#0f172a; line-height:1.5; }
+h1 { font-size: 20pt; margin: 0 0 8mm; }
+.meta { color:#475569; font-size:10pt; margin-bottom: 8mm; }
+.turn { margin: 5mm 0; }
+.role { font-weight:600; font-size:10pt; margin-bottom: 2mm; }
+.bubble { border:1px solid #e2e8f0; border-radius:8px; padding:5mm; }
+pre, code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size:9pt; white-space:pre-wrap; word-break:break-word; }
+</style></head><body>
+<h1>${escapeHtml(title)}</h1>
+<div class="meta">Exported ${nowIso()}</div>
+${turns
+  .map(
+    t => `<div class="turn">
+  <div class="role">${escapeHtml(String(t.role).toUpperCase())}</div>
+  <div class="bubble">${formatRich(String(t.content || ""))}</div>
+</div>`
+  )
+  .join("")}
+</body></html>`;
+
+    const browser = await chromium.launch({ args: ["--no-sandbox"] });
+    const page = await browser.newPage();
+    await page.setContent(html, { waitUntil: "load" });
+    const pdf = await page.pdf({ format: "A4", printBackground: true });
+    await browser.close();
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename="${slug(title)}.pdf"`);
+    return res.send(Buffer.from(pdf));
+  } catch (e) {
+    return res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+/* ---------------- start ---------------- */
+app.listen(PORT, () => console.log(`🚀 AI Chat Export Parser listening on :${PORT}`));
