@@ -24,6 +24,7 @@ const nowIso = () => new Date().toISOString();
 const isChatGPTShare = url => /^https?:\/\/(chatgpt\.com|chat\.openai\.com)\/share\//i.test(url);
 const clean = s => (s || "").replace(/\u00A0/g, " ").trim();
 
+/** Heuristic extractor for various JSON shapes from ChatGPT */
 function extractTurnsFromPossibleJSON(json) {
   const out = [];
   const paths = [
@@ -31,7 +32,7 @@ function extractTurnsFromPossibleJSON(json) {
     ["props", "pageProps", "sharedConversation", "mapping"],
     ["state", "conversation", "messages"],
     ["messages"],
-    ["turns"]
+    ["turns"],
   ];
   for (const p of paths) {
     let node = json;
@@ -66,7 +67,7 @@ function extractTurnsFromPossibleJSON(json) {
 }
 
 function extractFromEmbeddedJSON(html) {
-  // Fast regex path for __NEXT_DATA__
+  // Regex fast path for __NEXT_DATA__
   const m = html.match(/<script[^>]*id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i);
   if (m?.[1]) {
     try {
@@ -77,12 +78,11 @@ function extractFromEmbeddedJSON(html) {
         return {
           title: clean($('meta[property="og:title"]').attr("content") || $("title").text() || "Conversation"),
           model: $('meta[name="model"]').attr("content") || null,
-          turns
+          turns,
         };
       }
     } catch {}
   }
-
   // Fallback: any <script type="application/json">
   const $ = cheerio.load(html);
   for (const sel of ['script[type="application/json"]', "script[data-state]"]) {
@@ -97,7 +97,7 @@ function extractFromEmbeddedJSON(html) {
         return {
           title: clean($('meta[property="og:title"]').attr("content") || $("title").text() || "Conversation"),
           model: $('meta[name="model"]').attr("content") || null,
-          turns
+          turns,
         };
       }
     } catch {}
@@ -123,19 +123,51 @@ function extractFromDomHTML(html) {
   return {
     title: clean($('meta[property="og:title"]').attr("content") || $("title").text() || "Conversation"),
     model: $('meta[name="model"]').attr("content") || null,
-    turns
+    turns,
   };
 }
 
+/** Playwright: wait for app to hydrate, then read JSON or DOM */
 async function extractWithPlaywright(url) {
   const browser = await chromium.launch({ args: ["--no-sandbox"] });
   try {
-    const page = await browser.newPage();
-    await page.goto(url, { waitUntil: "networkidle", timeout: TIMEOUT_MS });
-    await page.waitForTimeout(800);
+    const context = await browser.newContext({
+      userAgent: UA,
+      locale: "en-US",
+    });
+    const page = await context.newPage();
+    await page.setExtraHTTPHeaders({
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.9,*/*;q=0.8",
+      "Accept-Language": "en-US,en;q=0.9",
+      "Upgrade-Insecure-Requests": "1",
+    });
+    await page.goto(url, { waitUntil: "networkidle", timeout: Math.max(20000, TIMEOUT_MS) });
+
+    // Try: wait for __NEXT_DATA__ and parse it
+    try {
+      await page.waitForSelector('script#__NEXT_DATA__', { timeout: 6000 });
+      const nextText = await page.$eval('script#__NEXT_DATA__', el => el.textContent || "");
+      if (nextText?.trim()?.startsWith("{")) {
+        const json = JSON.parse(nextText);
+        const turns = extractTurnsFromPossibleJSON(json);
+        if (turns.length) {
+          const title =
+            (await page.title()) || "Conversation";
+          return { title, model: null, turns };
+        }
+      }
+    } catch {
+      // ignore and try DOM
+    }
+
+    // Try: wait for hydrated DOM and scrape
+    try {
+      await page.waitForSelector("[data-message-author-role]", { timeout: 6000 });
+    } catch {}
     const html = await page.content();
     const dom = extractFromDomHTML(html);
     if (dom) return dom;
+
     return null;
   } finally {
     await browser.close();
@@ -147,12 +179,10 @@ app.get("/", (_req, res) => {
   res.type("text/plain").send("AI Chat Export Parser running. Try /healthz or /api/ingest?url=...");
 });
 
-app.get("/healthz", (_req, res) => {
-  res.json({ ok: true, ts: nowIso() });
-});
+app.get("/healthz", (_req, res) => res.json({ ok: true, ts: nowIso() }));
 
 app.get("/api/ingest", async (req, res) => {
-  res.set("Content-Type", "application/json; charset=utf-8"); // force JSON response
+  res.set("Content-Type", "application/json; charset=utf-8");
 
   try {
     const url = String(req.query.url || "");
@@ -161,6 +191,7 @@ app.get("/api/ingest", async (req, res) => {
 
     let parsed = null;
 
+    // 1) Static fetch → parse
     if (!FORCE_PLAYWRIGHT) {
       try {
         const r = await fetch(url, {
@@ -168,22 +199,20 @@ app.get("/api/ingest", async (req, res) => {
             "User-Agent": UA,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
-            "Upgrade-Insecure-Requests": "1"
-          }
+            "Upgrade-Insecure-Requests": "1",
+          },
         });
         if (r.ok) {
           const html = await r.text();
           parsed = extractFromEmbeddedJSON(html) || extractFromDomHTML(html);
-        } else if (![401, 403, 503].includes(r.status)) {
-          return res.status(422).json({ error: `fetch ${r.status}` });
         }
-      } catch {
-        /* fall through */
-      }
+      } catch {}
     }
 
+    // 2) Playwright fallback (robust)
     if (!parsed) parsed = await extractWithPlaywright(url);
 
+    // 3) Failure → diagnostics
     if (!parsed?.turns?.length) {
       if (String(req.query.debug) === "1") {
         try {
@@ -192,7 +221,7 @@ app.get("/api/ingest", async (req, res) => {
           const body = await r2.text();
           return res.status(422).json({
             error: "parse_failed",
-            debug: { contentType: ct, bytes: body.length, headSample: body.slice(0, 800) }
+            debug: { contentType: ct, bytes: body.length, headSample: body.slice(0, 800) },
           });
         } catch (e) {
           return res.status(422).json({ error: "parse_failed", note: "debug fetch failed", detail: String(e) });
@@ -207,7 +236,7 @@ app.get("/api/ingest", async (req, res) => {
       source: "chatgpt",
       canonical_url: url,
       fetched_at: nowIso(),
-      turns: parsed.turns.map((t, i) => ({ role: t.role, content: t.content, ord: i }))
+      turns: parsed.turns.map((t, i) => ({ role: t.role, content: t.content, ord: i })),
     });
   } catch (e) {
     return res.status(500).json({ error: String(e.message || e) });
