@@ -11,6 +11,9 @@ const TIMEOUT_MS = Number(process.env.TIMEOUT_MS || 45000);
 const MAX_BODY = process.env.MAX_BODY || "2mb";
 const FORCE_PLAYWRIGHT = process.env.FORCE_PLAYWRIGHT === "1";
 
+const UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
 /* ---------------- app ---------------- */
 const app = express();
 app.use(cors({ origin: ORIGINS }));
@@ -21,10 +24,6 @@ const nowIso = () => new Date().toISOString();
 const isChatGPTShare = url => /^https?:\/\/(chatgpt\.com|chat\.openai\.com)\/share\//i.test(url);
 const clean = s => (s || "").replace(/\u00A0/g, " ").trim();
 
-const UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
-
-/** Heuristic extractor for turns */
 function extractTurnsFromPossibleJSON(json) {
   const out = [];
   const paths = [
@@ -39,13 +38,17 @@ function extractTurnsFromPossibleJSON(json) {
     for (const k of p) node = node?.[k];
     if (!node) continue;
 
+    const push = (role, text) => {
+      const t = String(text ?? "").trim();
+      if (role && t) out.push({ role, content: t });
+    };
+
     if (Array.isArray(node)) {
       for (const m of node) {
         const role = m?.author?.role || m?.role;
         const parts = m?.content?.parts;
-        const text =
-          Array.isArray(parts) ? parts.join("\n\n") : m?.content?.text ?? m?.content ?? m?.text ?? "";
-        if (role && text) out.push({ role, content: clean(String(text)) });
+        const text = Array.isArray(parts) ? parts.join("\n\n") : m?.content?.text ?? m?.content ?? m?.text;
+        push(role, text);
       }
       if (out.length) return out;
     } else if (typeof node === "object") {
@@ -53,9 +56,8 @@ function extractTurnsFromPossibleJSON(json) {
         const msg = v?.message || v;
         const role = msg?.author?.role || msg?.role;
         const parts = msg?.content?.parts;
-        const text =
-          Array.isArray(parts) ? parts.join("\n\n") : msg?.content?.text ?? msg?.content ?? msg?.text ?? "";
-        if (role && text) out.push({ role, content: clean(String(text)) });
+        const text = Array.isArray(parts) ? parts.join("\n\n") : msg?.content?.text ?? msg?.content ?? msg?.text;
+        push(role, text);
       }
       if (out.length) return out;
     }
@@ -63,23 +65,17 @@ function extractTurnsFromPossibleJSON(json) {
   return out;
 }
 
-/** Extract from embedded <script> JSON */
 function extractFromEmbeddedJSON(html) {
-  // Regex fast path
-  const m = html.match(
-    /<script[^>]*id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i
-  );
-  if (m && m[1]) {
+  // Fast regex path for __NEXT_DATA__
+  const m = html.match(/<script[^>]*id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i);
+  if (m?.[1]) {
     try {
       const json = JSON.parse(m[1]);
       const turns = extractTurnsFromPossibleJSON(json);
       if (turns.length) {
         const $ = cheerio.load(html);
         return {
-          title:
-            ($('meta[property="og:title"]').attr("content") ||
-              $("title").text() ||
-              "Conversation").trim(),
+          title: clean($('meta[property="og:title"]').attr("content") || $("title").text() || "Conversation"),
           model: $('meta[name="model"]').attr("content") || null,
           turns
         };
@@ -89,11 +85,7 @@ function extractFromEmbeddedJSON(html) {
 
   // Fallback: any <script type="application/json">
   const $ = cheerio.load(html);
-  const candidates = [
-    'script[type="application/json"]',
-    'script[data-state]'
-  ];
-  for (const sel of candidates) {
+  for (const sel of ['script[type="application/json"]', "script[data-state]"]) {
     const el = $(sel).first();
     if (!el.length) continue;
     const text = (el.text() || "").trim();
@@ -103,10 +95,7 @@ function extractFromEmbeddedJSON(html) {
       const turns = extractTurnsFromPossibleJSON(json);
       if (turns.length) {
         return {
-          title:
-            ($('meta[property="og:title"]').attr("content") ||
-              $("title").text() ||
-              "Conversation").trim(),
+          title: clean($('meta[property="og:title"]').attr("content") || $("title").text() || "Conversation"),
           model: $('meta[name="model"]').attr("content") || null,
           turns
         };
@@ -116,12 +105,10 @@ function extractFromEmbeddedJSON(html) {
   return null;
 }
 
-/** Extract from hydrated DOM (static scrape) */
 function extractFromDomHTML(html) {
   const $ = cheerio.load(html);
   const nodes = $("[data-message-author-role]");
   if (!nodes.length) return null;
-
   const turns = [];
   nodes.each((_, el) => {
     const role = $(el).attr("data-message-author-role") || "assistant";
@@ -132,7 +119,6 @@ function extractFromDomHTML(html) {
     const text = clean($(el).text());
     if (text) turns.push({ role, content: text });
   });
-
   if (!turns.length) return null;
   return {
     title: clean($('meta[property="og:title"]').attr("content") || $("title").text() || "Conversation"),
@@ -141,7 +127,6 @@ function extractFromDomHTML(html) {
   };
 }
 
-/** Playwright fallback */
 async function extractWithPlaywright(url) {
   const browser = await chromium.launch({ args: ["--no-sandbox"] });
   try {
@@ -162,9 +147,13 @@ app.get("/", (_req, res) => {
   res.type("text/plain").send("AI Chat Export Parser running. Try /healthz or /api/ingest?url=...");
 });
 
-app.get("/healthz", (_req, res) => res.json({ ok: true, ts: nowIso() }));
+app.get("/healthz", (_req, res) => {
+  res.json({ ok: true, ts: nowIso() });
+});
 
 app.get("/api/ingest", async (req, res) => {
+  res.set("Content-Type", "application/json; charset=utf-8"); // force JSON response
+
   try {
     const url = String(req.query.url || "");
     if (!url) return res.status(400).json({ error: "url required" });
@@ -177,8 +166,7 @@ app.get("/api/ingest", async (req, res) => {
         const r = await fetch(url, {
           headers: {
             "User-Agent": UA,
-            "Accept":
-              "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.9,*/*;q=0.8",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
             "Upgrade-Insecure-Requests": "1"
           }
@@ -186,28 +174,31 @@ app.get("/api/ingest", async (req, res) => {
         if (r.ok) {
           const html = await r.text();
           parsed = extractFromEmbeddedJSON(html) || extractFromDomHTML(html);
+        } else if (![401, 403, 503].includes(r.status)) {
+          return res.status(422).json({ error: `fetch ${r.status}` });
         }
-      } catch {}
+      } catch {
+        /* fall through */
+      }
     }
 
     if (!parsed) parsed = await extractWithPlaywright(url);
 
     if (!parsed?.turns?.length) {
-      // Debug mode: return diagnostics
       if (String(req.query.debug) === "1") {
-        const r2 = await fetch(url, { headers: { "User-Agent": UA } });
-        const ct = r2.headers.get("content-type") || "";
-        const body = await r2.text();
-        return res.status(422).json({
-          error: "parse_failed",
-          debug: {
-            contentType: ct,
-            bytes: body.length,
-            headSample: body.slice(0, 600)
-          }
-        });
+        try {
+          const r2 = await fetch(url, { headers: { "User-Agent": UA } });
+          const ct = r2.headers.get("content-type") || "";
+          const body = await r2.text();
+          return res.status(422).json({
+            error: "parse_failed",
+            debug: { contentType: ct, bytes: body.length, headSample: body.slice(0, 800) }
+          });
+        } catch (e) {
+          return res.status(422).json({ error: "parse_failed", note: "debug fetch failed", detail: String(e) });
+        }
       }
-      return res.status(422).json({ error: "parse_failed", hint: "try ?debug=1" });
+      return res.status(422).json({ error: "parse_failed", hint: "append &debug=1 to inspect" });
     }
 
     return res.json({
@@ -230,6 +221,7 @@ app.post("/api/pdf", async (req, res) => {
     if (!title || !Array.isArray(turns)) {
       return res.status(400).json({ error: "title and turns required" });
     }
+
     const escapeHtml = s =>
       String(s).replace(/[&<>"']/g, m => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m]));
     const formatRich = text =>
@@ -239,20 +231,14 @@ app.post("/api/pdf", async (req, res) => {
     const slug = s => (s || "conversation").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
 
     const html = `<!doctype html><html><head><meta charset="utf-8"><style>
-body { font-family: sans-serif; }
-.role { font-weight: bold; margin-top: 1em; }
-.bubble { border: 1px solid #ccc; padding: 8px; border-radius: 6px; }
-pre, code { font-family: monospace; font-size: 10pt; }
+body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; }
+.role { font-weight: 600; margin-top: 12px; }
+.bubble { border: 1px solid #ddd; border-radius: 8px; padding: 10px; }
+pre, code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 10pt; }
 </style></head><body>
 <h1>${escapeHtml(title)}</h1>
-<div class="meta">Exported ${nowIso()}</div>
-${turns
-  .map(
-    t => `<div class="turn"><div class="role">${escapeHtml(t.role)}</div><div class="bubble">${formatRich(
-      String(t.content || "")
-    )}</div></div>`
-  )
-  .join("")}
+<div>Exported ${nowIso()}</div>
+${turns.map(t => `<div class="turn"><div class="role">${escapeHtml(t.role)}</div><div class="bubble">${formatRich(String(t.content||""))}</div></div>`).join("")}
 </body></html>`;
 
     const browser = await chromium.launch({ args: ["--no-sandbox"] });
