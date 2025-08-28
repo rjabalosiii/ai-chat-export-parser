@@ -16,22 +16,6 @@ const app = express();
 app.use(cors({ origin: ORIGINS }));
 app.use(express.json({ limit: MAX_BODY }));
 
-/* tiny in-memory rate limit (60 req/min/IP) */
-const hits = new Map();
-app.use((req, res, next) => {
-  const ip =
-    (req.headers["x-forwarded-for"]?.toString().split(",")[0] ||
-      req.socket.remoteAddress ||
-      "").trim();
-  const now = Date.now();
-  const arr = hits.get(ip) || [];
-  const recent = arr.filter(t => now - t < 60000);
-  recent.push(now);
-  hits.set(ip, recent);
-  if (recent.length > 60) return res.status(429).json({ error: "rate_limited" });
-  next();
-});
-
 /* ---------------- helpers ---------------- */
 const nowIso = () => new Date().toISOString();
 const isChatGPTShare = url => /^https?:\/\/(chatgpt\.com|chat\.openai\.com)\/share\//i.test(url);
@@ -40,7 +24,7 @@ const clean = s => (s || "").replace(/\u00A0/g, " ").trim();
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
-/** Try to extract turns from common JSON shapes embedded in the HTML */
+/** Heuristic extractor for turns */
 function extractTurnsFromPossibleJSON(json) {
   const out = [];
   const paths = [
@@ -79,37 +63,60 @@ function extractTurnsFromPossibleJSON(json) {
   return out;
 }
 
-/** Parse from embedded <script> JSON inside the HTML */
+/** Extract from embedded <script> JSON */
 function extractFromEmbeddedJSON(html) {
+  // Regex fast path
+  const m = html.match(
+    /<script[^>]*id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i
+  );
+  if (m && m[1]) {
+    try {
+      const json = JSON.parse(m[1]);
+      const turns = extractTurnsFromPossibleJSON(json);
+      if (turns.length) {
+        const $ = cheerio.load(html);
+        return {
+          title:
+            ($('meta[property="og:title"]').attr("content") ||
+              $("title").text() ||
+              "Conversation").trim(),
+          model: $('meta[name="model"]').attr("content") || null,
+          turns
+        };
+      }
+    } catch {}
+  }
+
+  // Fallback: any <script type="application/json">
   const $ = cheerio.load(html);
   const candidates = [
-    'script[id="__NEXT_DATA__"]',
     'script[type="application/json"]',
-    "script[data-state]"
+    'script[data-state]'
   ];
   for (const sel of candidates) {
     const el = $(sel).first();
     if (!el.length) continue;
-    const text = el.text().trim();
+    const text = (el.text() || "").trim();
     if (!text || (text[0] !== "{" && text[0] !== "[")) continue;
     try {
       const json = JSON.parse(text);
       const turns = extractTurnsFromPossibleJSON(json);
       if (turns.length) {
         return {
-          title: clean($('meta[property="og:title"]').attr("content") || $("title").text() || "Conversation"),
+          title:
+            ($('meta[property="og:title"]').attr("content") ||
+              $("title").text() ||
+              "Conversation").trim(),
           model: $('meta[name="model"]').attr("content") || null,
           turns
         };
       }
-    } catch {
-      /* continue */
-    }
+    } catch {}
   }
   return null;
 }
 
-/** Parse hydrated DOM without JS execution */
+/** Extract from hydrated DOM (static scrape) */
 function extractFromDomHTML(html) {
   const $ = cheerio.load(html);
   const nodes = $("[data-message-author-role]");
@@ -118,7 +125,6 @@ function extractFromDomHTML(html) {
   const turns = [];
   nodes.each((_, el) => {
     const role = $(el).attr("data-message-author-role") || "assistant";
-    // preserve code blocks
     $(el).find("pre").each((__, pre) => {
       const code = $(pre).text();
       $(pre).replaceWith("```" + "\n" + code + "\n" + "```");
@@ -135,45 +141,16 @@ function extractFromDomHTML(html) {
   };
 }
 
-/** Full-headless fallback using Playwright */
+/** Playwright fallback */
 async function extractWithPlaywright(url) {
   const browser = await chromium.launch({ args: ["--no-sandbox"] });
   try {
     const page = await browser.newPage();
     await page.goto(url, { waitUntil: "networkidle", timeout: TIMEOUT_MS });
     await page.waitForTimeout(800);
-
-    // try DOM after hydration
     const html = await page.content();
     const dom = extractFromDomHTML(html);
     if (dom) return dom;
-
-    // do a quick in-page scrape as a last resort
-    const data = await page.evaluate(() => {
-      const items = Array.from(document.querySelectorAll("[data-message-author-role]"));
-      if (!items.length) return null;
-      items.forEach(el => {
-        el.querySelectorAll("pre").forEach(pre => {
-          const txt = pre.textContent || "";
-          const div = document.createElement("div");
-          div.textContent = "```" + "\n" + txt + "\n" + "```";
-          pre.replaceWith(div);
-        });
-      });
-      const turns = items
-        .map(el => ({
-          role: el.getAttribute("data-message-author-role") || "assistant",
-          content: (el.textContent || "").trim()
-        }))
-        .filter(t => t.content);
-      const title =
-        document.querySelector('meta[property="og:title"]')?.getAttribute("content") ||
-        document.title ||
-        "Conversation";
-      const model = document.querySelector('meta[name="model"]')?.getAttribute("content") || null;
-      return { title, model, turns };
-    });
-    if (data?.turns?.length) return data;
     return null;
   } finally {
     await browser.close();
@@ -182,15 +159,11 @@ async function extractWithPlaywright(url) {
 
 /* ---------------- routes ---------------- */
 app.get("/", (_req, res) => {
-  res.type("text/plain").send("AI Chat Export Parser is running. Try /healthz or /api/ingest?url=...");
+  res.type("text/plain").send("AI Chat Export Parser running. Try /healthz or /api/ingest?url=...");
 });
 
 app.get("/healthz", (_req, res) => res.json({ ok: true, ts: nowIso() }));
 
-/**
- * GET /api/ingest?url=<chatgpt_share_link>
- * Returns { title, model, source, canonical_url, fetched_at, turns:[{role,content,ord}] }
- */
 app.get("/api/ingest", async (req, res) => {
   try {
     const url = String(req.query.url || "");
@@ -199,7 +172,6 @@ app.get("/api/ingest", async (req, res) => {
 
     let parsed = null;
 
-    // 1) Static fetch with browser-like headers
     if (!FORCE_PLAYWRIGHT) {
       try {
         const r = await fetch(url, {
@@ -214,19 +186,28 @@ app.get("/api/ingest", async (req, res) => {
         if (r.ok) {
           const html = await r.text();
           parsed = extractFromEmbeddedJSON(html) || extractFromDomHTML(html);
-        } else if (![403, 401, 503].includes(r.status)) {
-          return res.status(422).json({ error: `fetch ${r.status}` });
         }
-      } catch {
-        /* ignore; try Playwright */
-      }
+      } catch {}
     }
 
-    // 2) Playwright fallback
     if (!parsed) parsed = await extractWithPlaywright(url);
 
     if (!parsed?.turns?.length) {
-      return res.status(422).json({ error: "parse_failed", hint: "try manual paste" });
+      // Debug mode: return diagnostics
+      if (String(req.query.debug) === "1") {
+        const r2 = await fetch(url, { headers: { "User-Agent": UA } });
+        const ct = r2.headers.get("content-type") || "";
+        const body = await r2.text();
+        return res.status(422).json({
+          error: "parse_failed",
+          debug: {
+            contentType: ct,
+            bytes: body.length,
+            headSample: body.slice(0, 600)
+          }
+        });
+      }
+      return res.status(422).json({ error: "parse_failed", hint: "try ?debug=1" });
     }
 
     return res.json({
@@ -242,14 +223,13 @@ app.get("/api/ingest", async (req, res) => {
   }
 });
 
-/* --------- PDF endpoint (HTML -> PDF via Playwright) --------- */
+/* --------- PDF endpoint --------- */
 app.post("/api/pdf", async (req, res) => {
   try {
     const { title, turns } = req.body || {};
     if (!title || !Array.isArray(turns)) {
       return res.status(400).json({ error: "title and turns required" });
     }
-
     const escapeHtml = s =>
       String(s).replace(/[&<>"']/g, m => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m]));
     const formatRich = text =>
@@ -259,23 +239,18 @@ app.post("/api/pdf", async (req, res) => {
     const slug = s => (s || "conversation").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
 
     const html = `<!doctype html><html><head><meta charset="utf-8"><style>
-@page { margin: 22mm; }
-body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; color:#0f172a; line-height:1.5; }
-h1 { font-size: 20pt; margin: 0 0 8mm; }
-.meta { color:#475569; font-size:10pt; margin-bottom: 8mm; }
-.turn { margin: 5mm 0; }
-.role { font-weight:600; font-size:10pt; margin-bottom: 2mm; }
-.bubble { border:1px solid #e2e8f0; border-radius:8px; padding:5mm; }
-pre, code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size:9pt; white-space:pre-wrap; word-break:break-word; }
+body { font-family: sans-serif; }
+.role { font-weight: bold; margin-top: 1em; }
+.bubble { border: 1px solid #ccc; padding: 8px; border-radius: 6px; }
+pre, code { font-family: monospace; font-size: 10pt; }
 </style></head><body>
 <h1>${escapeHtml(title)}</h1>
 <div class="meta">Exported ${nowIso()}</div>
 ${turns
   .map(
-    t => `<div class="turn">
-  <div class="role">${escapeHtml(String(t.role).toUpperCase())}</div>
-  <div class="bubble">${formatRich(String(t.content || ""))}</div>
-</div>`
+    t => `<div class="turn"><div class="role">${escapeHtml(t.role)}</div><div class="bubble">${formatRich(
+      String(t.content || "")
+    )}</div></div>`
   )
   .join("")}
 </body></html>`;
