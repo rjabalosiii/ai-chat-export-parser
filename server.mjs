@@ -19,6 +19,20 @@ const app = express();
 app.use(cors({ origin: ORIGINS }));
 app.use(express.json({ limit: MAX_BODY }));
 
+// Log every request path (check Railway logs when you hit endpoints)
+app.use((req, _res, next) => {
+  console.log(`[REQ] ${req.method} ${req.path}${req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : ""}`);
+  next();
+});
+
+// Force JSON on *all* /api/* routes except /api/pdf (which returns a PDF)
+app.use((req, res, next) => {
+  if (req.path.startsWith("/api/") && req.path !== "/api/pdf") {
+    res.set("Content-Type", "application/json; charset=utf-8");
+  }
+  next();
+});
+
 /* ---------------- helpers ---------------- */
 const nowIso = () => new Date().toISOString();
 const isChatGPTShare = url => /^https?:\/\/(chatgpt\.com|chat\.openai\.com)\/share\//i.test(url);
@@ -32,7 +46,7 @@ function extractTurnsFromPossibleJSON(json) {
     ["props", "pageProps", "sharedConversation", "mapping"],
     ["state", "conversation", "messages"],
     ["messages"],
-    ["turns"],
+    ["turns"]
   ];
   for (const p of paths) {
     let node = json;
@@ -66,8 +80,9 @@ function extractTurnsFromPossibleJSON(json) {
   return out;
 }
 
+/** Try to parse embedded <script> JSON from HTML */
 function extractFromEmbeddedJSON(html) {
-  // Regex fast path for __NEXT_DATA__
+  // __NEXT_DATA__ fast path
   const m = html.match(/<script[^>]*id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i);
   if (m?.[1]) {
     try {
@@ -78,12 +93,12 @@ function extractFromEmbeddedJSON(html) {
         return {
           title: clean($('meta[property="og:title"]').attr("content") || $("title").text() || "Conversation"),
           model: $('meta[name="model"]').attr("content") || null,
-          turns,
+          turns
         };
       }
     } catch {}
   }
-  // Fallback: any <script type="application/json">
+  // Generic JSON blobs
   const $ = cheerio.load(html);
   for (const sel of ['script[type="application/json"]', "script[data-state]"]) {
     const el = $(sel).first();
@@ -97,7 +112,7 @@ function extractFromEmbeddedJSON(html) {
         return {
           title: clean($('meta[property="og:title"]').attr("content") || $("title").text() || "Conversation"),
           model: $('meta[name="model"]').attr("content") || null,
-          turns,
+          turns
         };
       }
     } catch {}
@@ -105,6 +120,7 @@ function extractFromEmbeddedJSON(html) {
   return null;
 }
 
+/** Parse hydrated DOM without executing JS */
 function extractFromDomHTML(html) {
   const $ = cheerio.load(html);
   const nodes = $("[data-message-author-role]");
@@ -123,27 +139,24 @@ function extractFromDomHTML(html) {
   return {
     title: clean($('meta[property="og:title"]').attr("content") || $("title").text() || "Conversation"),
     model: $('meta[name="model"]').attr("content") || null,
-    turns,
+    turns
   };
 }
 
-/** Playwright: wait for app to hydrate, then read JSON or DOM */
+/** Playwright renderer: wait for hydration, then read JSON or DOM */
 async function extractWithPlaywright(url) {
   const browser = await chromium.launch({ args: ["--no-sandbox"] });
   try {
-    const context = await browser.newContext({
-      userAgent: UA,
-      locale: "en-US",
-    });
+    const context = await browser.newContext({ userAgent: UA, locale: "en-US" });
     const page = await context.newPage();
     await page.setExtraHTTPHeaders({
       "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.9,*/*;q=0.8",
       "Accept-Language": "en-US,en;q=0.9",
-      "Upgrade-Insecure-Requests": "1",
+      "Upgrade-Insecure-Requests": "1"
     });
-    await page.goto(url, { waitUntil: "networkidle", timeout: Math.max(20000, TIMEOUT_MS) });
+    await page.goto(url, { waitUntil: "networkidle", timeout: Math.max(25000, TIMEOUT_MS) });
 
-    // Try: wait for __NEXT_DATA__ and parse it
+    // Try __NEXT_DATA__ first
     try {
       await page.waitForSelector('script#__NEXT_DATA__', { timeout: 6000 });
       const nextText = await page.$eval('script#__NEXT_DATA__', el => el.textContent || "");
@@ -151,19 +164,16 @@ async function extractWithPlaywright(url) {
         const json = JSON.parse(nextText);
         const turns = extractTurnsFromPossibleJSON(json);
         if (turns.length) {
-          const title =
-            (await page.title()) || "Conversation";
+          const title = (await page.title()) || "Conversation";
           return { title, model: null, turns };
         }
       }
     } catch {
-      // ignore and try DOM
+      /* ignore */
     }
 
-    // Try: wait for hydrated DOM and scrape
-    try {
-      await page.waitForSelector("[data-message-author-role]", { timeout: 6000 });
-    } catch {}
+    // Fallback: hydrated DOM
+    try { await page.waitForSelector("[data-message-author-role]", { timeout: 6000 }); } catch {}
     const html = await page.content();
     const dom = extractFromDomHTML(html);
     if (dom) return dom;
@@ -176,14 +186,26 @@ async function extractWithPlaywright(url) {
 
 /* ---------------- routes ---------------- */
 app.get("/", (_req, res) => {
+  // Note: not /api/* so it's allowed to be text
   res.type("text/plain").send("AI Chat Export Parser running. Try /healthz or /api/ingest?url=...");
 });
 
 app.get("/healthz", (_req, res) => res.json({ ok: true, ts: nowIso() }));
 
-app.get("/api/ingest", async (req, res) => {
-  res.set("Content-Type", "application/json; charset=utf-8");
+// sanity: verify query parsing & JSON-only behavior
+app.get("/api/echo", (req, res) => {
+  res.json({
+    ok: true,
+    urlParam: req.query.url ?? null,
+    debug: req.query.debug ?? null,
+    note: "If you see this as JSON, /api/* is working and not returning HTML."
+  });
+});
 
+/**
+ * GET /api/ingest?url=<encoded share link>&debug=1
+ */
+app.get("/api/ingest", async (req, res) => {
   try {
     const url = String(req.query.url || "");
     if (!url) return res.status(400).json({ error: "url required" });
@@ -191,7 +213,7 @@ app.get("/api/ingest", async (req, res) => {
 
     let parsed = null;
 
-    // 1) Static fetch → parse
+    // 1) Static fetch
     if (!FORCE_PLAYWRIGHT) {
       try {
         const r = await fetch(url, {
@@ -199,8 +221,8 @@ app.get("/api/ingest", async (req, res) => {
             "User-Agent": UA,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
-            "Upgrade-Insecure-Requests": "1",
-          },
+            "Upgrade-Insecure-Requests": "1"
+          }
         });
         if (r.ok) {
           const html = await r.text();
@@ -209,10 +231,10 @@ app.get("/api/ingest", async (req, res) => {
       } catch {}
     }
 
-    // 2) Playwright fallback (robust)
+    // 2) Playwright fallback
     if (!parsed) parsed = await extractWithPlaywright(url);
 
-    // 3) Failure → diagnostics
+    // 3) Failure diagnostics
     if (!parsed?.turns?.length) {
       if (String(req.query.debug) === "1") {
         try {
@@ -221,7 +243,7 @@ app.get("/api/ingest", async (req, res) => {
           const body = await r2.text();
           return res.status(422).json({
             error: "parse_failed",
-            debug: { contentType: ct, bytes: body.length, headSample: body.slice(0, 800) },
+            debug: { contentType: ct, bytes: body.length, headSample: body.slice(0, 600) }
           });
         } catch (e) {
           return res.status(422).json({ error: "parse_failed", note: "debug fetch failed", detail: String(e) });
@@ -236,14 +258,14 @@ app.get("/api/ingest", async (req, res) => {
       source: "chatgpt",
       canonical_url: url,
       fetched_at: nowIso(),
-      turns: parsed.turns.map((t, i) => ({ role: t.role, content: t.content, ord: i })),
+      turns: parsed.turns.map((t, i) => ({ role: t.role, content: t.content, ord: i }))
     });
   } catch (e) {
     return res.status(500).json({ error: String(e.message || e) });
   }
 });
 
-/* --------- PDF endpoint --------- */
+/* --------- PDF endpoint (keeps PDF content-type) --------- */
 app.post("/api/pdf", async (req, res) => {
   try {
     const { title, turns } = req.body || {};
