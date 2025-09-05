@@ -265,6 +265,20 @@ app.get("/api/ingest", async (req, res) => {
   }
 });
 
+// Alias endpoint that uses ?src=... instead of ?url=...
+app.get("/api/ingest2", async (req, res) => {
+  // Always force JSON
+  res.set("Content-Type", "application/json; charset=utf-8");
+  res.set("X-Content-Type-Options", "nosniff");
+
+  // Map ?src=... into ?url=... so we can reuse the existing logic
+  req.query.url = req.query.src || req.query.u || req.query.link || req.query.target || "";
+  
+  // Forward into the original /api/ingest handler
+  return app._router.handle(req, res, () => {});
+});
+
+
 /* --------- PDF endpoint (keeps PDF content-type) --------- */
 app.post("/api/pdf", async (req, res) => {
   try {
