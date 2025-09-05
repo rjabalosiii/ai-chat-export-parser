@@ -19,16 +19,17 @@ const app = express();
 app.use(cors({ origin: ORIGINS }));
 app.use(express.json({ limit: MAX_BODY }));
 
-// Log every request path (check Railway logs when you hit endpoints)
+// Log every request path (view in Railway logs)
 app.use((req, _res, next) => {
   console.log(`[REQ] ${req.method} ${req.path}${req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : ""}`);
   next();
 });
 
-// Force JSON on *all* /api/* routes except /api/pdf (which returns a PDF)
+// Force JSON on all /api/* routes except /api/pdf (which returns PDF)
 app.use((req, res, next) => {
   if (req.path.startsWith("/api/") && req.path !== "/api/pdf") {
     res.set("Content-Type", "application/json; charset=utf-8");
+    res.set("X-Content-Type-Options", "nosniff");
   }
   next();
 });
@@ -197,87 +198,93 @@ app.get("/api/echo", (req, res) => {
   res.json({
     ok: true,
     urlParam: req.query.url ?? null,
+    srcParam: req.query.src ?? null,
     debug: req.query.debug ?? null,
     note: "If you see this as JSON, /api/* is working and not returning HTML."
   });
 });
 
-/**
- * GET /api/ingest?url=<encoded share link>&debug=1
- */
-app.get("/api/ingest", async (req, res) => {
-  try {
-    const url = String(req.query.url || "");
-    if (!url) return res.status(400).json({ error: "url required" });
-    if (!isChatGPTShare(url)) return res.status(400).json({ error: "only chatgpt share links supported" });
+/** Core logic extracted so we can call it from multiple routes */
+async function ingestCore(targetUrl, debugFlag) {
+  if (!targetUrl) return { status: 400, body: { error: "url required" } };
+  if (!isChatGPTShare(targetUrl)) return { status: 400, body: { error: "only chatgpt share links supported" } };
 
-    let parsed = null;
-
-    // 1) Static fetch
-    if (!FORCE_PLAYWRIGHT) {
-      try {
-        const r = await fetch(url, {
-          headers: {
-            "User-Agent": UA,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Upgrade-Insecure-Requests": "1"
-          }
-        });
-        if (r.ok) {
-          const html = await r.text();
-          parsed = extractFromEmbeddedJSON(html) || extractFromDomHTML(html);
+  // 1) Static fetch → embedded JSON → DOM
+  let parsed = null;
+  if (!FORCE_PLAYWRIGHT) {
+    try {
+      const r = await fetch(targetUrl, {
+        headers: {
+          "User-Agent": UA,
+          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.9,*/*;q=0.8",
+          "Accept-Language": "en-US,en;q=0.9",
+          "Upgrade-Insecure-Requests": "1"
         }
-      } catch {}
-    }
-
-    // 2) Playwright fallback
-    if (!parsed) parsed = await extractWithPlaywright(url);
-
-    // 3) Failure diagnostics
-    if (!parsed?.turns?.length) {
-      if (String(req.query.debug) === "1") {
-        try {
-          const r2 = await fetch(url, { headers: { "User-Agent": UA } });
-          const ct = r2.headers.get("content-type") || "";
-          const body = await r2.text();
-          return res.status(422).json({
-            error: "parse_failed",
-            debug: { contentType: ct, bytes: body.length, headSample: body.slice(0, 600) }
-          });
-        } catch (e) {
-          return res.status(422).json({ error: "parse_failed", note: "debug fetch failed", detail: String(e) });
-        }
+      });
+      if (r.ok) {
+        const html = await r.text();
+        parsed = extractFromEmbeddedJSON(html) || extractFromDomHTML(html);
       }
-      return res.status(422).json({ error: "parse_failed", hint: "append &debug=1 to inspect" });
-    }
+    } catch { /* fall through */ }
+  }
 
-    return res.json({
+  // 2) Playwright fallback (hydrated)
+  if (!parsed) parsed = await extractWithPlaywright(targetUrl);
+
+  // 3) Failure diagnostics
+  if (!parsed?.turns?.length) {
+    if (debugFlag) {
+      try {
+        const r2 = await fetch(targetUrl, { headers: { "User-Agent": UA } });
+        const ct = r2.headers.get("content-type") || "";
+        const body = await r2.text();
+        return {
+          status: 422,
+          body: { error: "parse_failed", debug: { contentType: ct, bytes: body.length, headSample: body.slice(0, 800) } }
+        };
+      } catch (e) {
+        return { status: 422, body: { error: "parse_failed", note: "debug fetch failed", detail: String(e) } };
+      }
+    }
+    return { status: 422, body: { error: "parse_failed", hint: "append &debug=1 to inspect" } };
+  }
+
+  return {
+    status: 200,
+    body: {
       title: parsed.title || "Conversation",
       model: parsed.model || null,
       source: "chatgpt",
-      canonical_url: url,
+      canonical_url: targetUrl,
       fetched_at: nowIso(),
       turns: parsed.turns.map((t, i) => ({ role: t.role, content: t.content, ord: i }))
-    });
-  } catch (e) {
-    return res.status(500).json({ error: String(e.message || e) });
-  }
+    }
+  };
+}
+
+/** GET /api/ingest?url=... */
+app.get("/api/ingest", async (req, res) => {
+  const targetUrl = String(req.query.url || "");
+  const debugFlag = String(req.query.debug || "") === "1";
+  const result = await ingestCore(targetUrl, debugFlag);
+  return res.status(result.status).json(result.body);
 });
 
-// Alias endpoint that uses ?src=... instead of ?url=...
+/** GET /api/ingest2?src=...  (alias avoiding `url=` param) */
 app.get("/api/ingest2", async (req, res) => {
-  // Always force JSON
-  res.set("Content-Type", "application/json; charset=utf-8");
-  res.set("X-Content-Type-Options", "nosniff");
-
-  // Map ?src=... into ?url=... so we can reuse the existing logic
-  req.query.url = req.query.src || req.query.u || req.query.link || req.query.target || "";
-  
-  // Forward into the original /api/ingest handler
-  return app._router.handle(req, res, () => {});
+  const targetUrl = String(req.query.src || req.query.u || req.query.link || req.query.target || "");
+  const debugFlag = String(req.query.debug || "") === "1";
+  const result = await ingestCore(targetUrl, debugFlag);
+  return res.status(result.status).json(result.body);
 });
 
+/** POST /api/ingest  { "url": "..." }  (best for clients; no query follow issues) */
+app.post("/api/ingest", async (req, res) => {
+  const targetUrl = String((req.body && (req.body.url || req.body.src)) || "");
+  const debugFlag = Boolean(req.body && (req.body.debug === 1 || req.body.debug === true));
+  const result = await ingestCore(targetUrl, debugFlag);
+  return res.status(result.status).json(result.body);
+});
 
 /* --------- PDF endpoint (keeps PDF content-type) --------- */
 app.post("/api/pdf", async (req, res) => {
