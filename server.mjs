@@ -12,6 +12,7 @@ const TIMEOUT_MS = Number(process.env.TIMEOUT_MS || 45000);
 const MAX_BODY = process.env.MAX_BODY || "2mb";
 const FORCE_PLAYWRIGHT = process.env.FORCE_PLAYWRIGHT === "1";
 const DRY_RUN = process.env.DRY_RUN === "1";
+const MAX_CONCURRENCY = Number(process.env.CONCURRENCY || 1);
 
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
@@ -146,10 +147,39 @@ function extractFromDomHTML(html) {
   };
 }
 
-/** Playwright renderer: wait for hydration, then read JSON or DOM */
+/* ---- Playwright: single browser instance + safer flags ---- */
+let PW_BROWSER = null;
+async function getBrowser() {
+  if (PW_BROWSER) return PW_BROWSER;
+  PW_BROWSER = await chromium.launch({
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage", // avoid small /dev/shm crashes
+      "--disable-gpu",
+      "--no-zygote",
+      "--single-process"
+    ]
+  });
+  // clean shutdown
+  for (const sig of ["SIGINT", "SIGTERM", "SIGQUIT"]) {
+    process.once(sig, async () => {
+      try { await PW_BROWSER?.close(); } catch {}
+      process.exit(0);
+    });
+  }
+  return PW_BROWSER;
+}
+
+let INFLIGHT = 0;
 async function extractWithPlaywright(url) {
-  const browser = await chromium.launch({ args: ["--no-sandbox"] });
+  // simple queue to limit memory usage
+  while (INFLIGHT >= MAX_CONCURRENCY) {
+    await new Promise(r => setTimeout(r, 50));
+  }
+  INFLIGHT++;
   try {
+    const browser = await getBrowser();
     const context = await browser.newContext({ userAgent: UA, locale: "en-US" });
     const page = await context.newPage();
     await page.setExtraHTTPHeaders({
@@ -157,57 +187,40 @@ async function extractWithPlaywright(url) {
       "Accept-Language": "en-US,en;q=0.9",
       "Upgrade-Insecure-Requests": "1"
     });
-    await page.goto(url, { waitUntil: "networkidle", timeout: Math.max(25000, TIMEOUT_MS) });
+    await page.goto(url, { waitUntil: "networkidle", timeout: Math.max(60000, TIMEOUT_MS) });
 
     // Try __NEXT_DATA__ first
     try {
-      await page.waitForSelector('script#__NEXT_DATA__', { timeout: 6000 });
+      await page.waitForSelector('script#__NEXT_DATA__', { timeout: 8000 });
       const nextText = await page.$eval('script#__NEXT_DATA__', el => el.textContent || "");
       if (nextText?.trim()?.startsWith("{")) {
         const json = JSON.parse(nextText);
         const turns = extractTurnsFromPossibleJSON(json);
         if (turns.length) {
           const title = (await page.title()) || "Conversation";
+          await context.close();
           return { title, model: null, turns };
         }
       }
-    } catch {
-      /* ignore */
-    }
+    } catch {}
 
     // Fallback: hydrated DOM
-    try { await page.waitForSelector("[data-message-author-role]", { timeout: 6000 }); } catch {}
+    try { await page.waitForSelector("[data-message-author-role]", { timeout: 8000 }); } catch {}
     const html = await page.content();
+    await context.close();
     const dom = extractFromDomHTML(html);
     if (dom) return dom;
 
     return null;
+  } catch (e) {
+    console.error("Playwright error:", e);
+    throw e;
   } finally {
-    await browser.close();
+    INFLIGHT--;
   }
 }
 
-/* ---------------- routes ---------------- */
-app.get("/", (_req, res) => {
-  // Note: not /api/* so it's allowed to be text
-  res.type("text/plain").send("AI Chat Export Parser running. Try /healthz or /api/ingest?url=...");
-});
-
-app.get("/healthz", (_req, res) => res.json({ ok: true, ts: nowIso(), dryRun: DRY_RUN }));
-
-// sanity: verify query parsing & JSON-only behavior
-app.get("/api/echo", (req, res) => {
-  res.json({
-    ok: true,
-    urlParam: req.query.url ?? null,
-    srcParam: req.query.src ?? null,
-    debug: req.query.debug ?? null,
-    dryRun: DRY_RUN,
-    note: "If you see this as JSON, /api/* is working and not returning HTML."
-  });
-});
-
-/** Core logic extracted so we can call it from multiple routes */
+/* ---------------- core ingest ---------------- */
 async function ingestCore(targetUrl, debugFlag) {
   if (DRY_RUN) {
     return {
@@ -277,6 +290,24 @@ async function ingestCore(targetUrl, debugFlag) {
   };
 }
 
+/* ---------------- routes ---------------- */
+app.get("/", (_req, res) => {
+  res.type("text/plain").send("AI Chat Export Parser running. Try /healthz or /api/ingest?url=...");
+});
+
+app.get("/healthz", (_req, res) => res.json({ ok: true, ts: nowIso(), dryRun: DRY_RUN }));
+
+// sanity: verify query parsing & JSON-only behavior
+app.get("/api/echo", (req, res) => {
+  res.json({
+    ok: true,
+    urlParam: req.query.url ?? null,
+    srcParam: req.query.src ?? null,
+    debug: req.query.debug ?? null,
+    dryRun: DRY_RUN
+  });
+});
+
 /** GET /api/ingest?url=... */
 app.get("/api/ingest", async (req, res) => {
   const targetUrl = String(req.query.url || "");
@@ -342,11 +373,12 @@ pre, code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 
 ${turns.map(t => `<div class="turn"><div class="role">${escapeHtml(t.role)}</div><div class="bubble">${formatRich(String(t.content||""))}</div></div>`).join("")}
 </body></html>`;
 
-    const browser = await chromium.launch({ args: ["--no-sandbox"] });
-    const page = await browser.newPage();
+    const browser = await getBrowser();
+    const context = await browser.newContext();
+    const page = await context.newPage();
     await page.setContent(html, { waitUntil: "load" });
     const pdf = await page.pdf({ format: "A4", printBackground: true });
-    await browser.close();
+    await context.close();
 
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", `attachment; filename="${slug(title)}.pdf"`);
@@ -357,4 +389,4 @@ ${turns.map(t => `<div class="turn"><div class="role">${escapeHtml(t.role)}</div
 });
 
 /* ---------------- start ---------------- */
-app.listen(PORT, () => console.log(`🚀 AI Chat Export Parser listening on :${PORT} (DRY_RUN=${DRY_RUN ? "1" : "0"})`));
+app.listen(PORT, () => console.log(`🚀 AI Chat Export Parser listening on :${PORT} (DRY_RUN=${DRY_RUN ? "1" : "0"}, CONCURRENCY=${MAX_CONCURRENCY})`));
