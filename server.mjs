@@ -14,21 +14,20 @@ const FORCE_PLAYWRIGHT = process.env.FORCE_PLAYWRIGHT === "1";
 const DRY_RUN = process.env.DRY_RUN === "1";
 const MAX_CONCURRENCY = Number(process.env.CONCURRENCY || 1);
 
-const UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
 /* ---------------- app ---------------- */
 const app = express();
 app.use(cors({ origin: ORIGINS }));
 app.use(express.json({ limit: MAX_BODY }));
 
-// Log every request path (view in Railway logs)
+// Log every request path
 app.use((req, _res, next) => {
   console.log(`[REQ] ${req.method} ${req.path}${req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : ""}`);
   next();
 });
 
-// Force JSON on all /api/* routes except /api/pdf (which returns PDF)
+// Force JSON on all /api/* except /api/pdf
 app.use((req, res, next) => {
   if (req.path.startsWith("/api/") && req.path !== "/api/pdf") {
     res.set("Content-Type", "application/json; charset=utf-8");
@@ -41,6 +40,14 @@ app.use((req, res, next) => {
 const nowIso = () => new Date().toISOString();
 const isChatGPTShare = url => /^https?:\/\/(chatgpt\.com|chat\.openai\.com)\/share\//i.test(url);
 const clean = s => (s || "").replace(/\u00A0/g, " ").trim();
+
+function withTimeout(promise, ms, label = "operation") {
+  let to;
+  const timeout = new Promise((_r, reject) => {
+    to = setTimeout(() => reject(new Error(`${label}_timeout_${ms}ms`)), ms);
+  });
+  return Promise.race([promise.finally(() => clearTimeout(to)), timeout]);
+}
 
 /** Heuristic extractor for various JSON shapes from ChatGPT */
 function extractTurnsFromPossibleJSON(json) {
@@ -86,7 +93,6 @@ function extractTurnsFromPossibleJSON(json) {
 
 /** Try to parse embedded <script> JSON from HTML */
 function extractFromEmbeddedJSON(html) {
-  // __NEXT_DATA__ fast path
   const m = html.match(/<script[^>]*id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i);
   if (m?.[1]) {
     try {
@@ -102,7 +108,6 @@ function extractFromEmbeddedJSON(html) {
       }
     } catch {}
   }
-  // Generic JSON blobs
   const $ = cheerio.load(html);
   for (const sel of ['script[type="application/json"]', "script[data-state]"]) {
     const el = $(sel).first();
@@ -147,21 +152,23 @@ function extractFromDomHTML(html) {
   };
 }
 
-/* ---- Playwright: single browser instance + safer flags ---- */
+/* ---- Playwright: single browser instance + warm-up and safe flags ---- */
 let PW_BROWSER = null;
+let READY = false;
+let INFLIGHT = 0;
+
 async function getBrowser() {
   if (PW_BROWSER) return PW_BROWSER;
   PW_BROWSER = await chromium.launch({
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage", // avoid small /dev/shm crashes
+      "--disable-dev-shm-usage",
       "--disable-gpu",
       "--no-zygote",
       "--single-process"
     ]
   });
-  // clean shutdown
   for (const sig of ["SIGINT", "SIGTERM", "SIGQUIT"]) {
     process.once(sig, async () => {
       try { await PW_BROWSER?.close(); } catch {}
@@ -171,7 +178,21 @@ async function getBrowser() {
   return PW_BROWSER;
 }
 
-let INFLIGHT = 0;
+async function warmup() {
+  try {
+    const b = await getBrowser();
+    const ctx = await b.newContext({ userAgent: UA, locale: "en-US" });
+    const page = await ctx.newPage();
+    await page.setContent("<html><body>warmup</body></html>");
+    await ctx.close();
+    READY = true;
+    console.log("✅ Playwright warm-up complete");
+  } catch (e) {
+    console.error("❌ Playwright warm-up failed:", e);
+  }
+}
+
+/** uses Playwright with queue + timeout */
 async function extractWithPlaywright(url) {
   // simple queue to limit memory usage
   while (INFLIGHT >= MAX_CONCURRENCY) {
@@ -187,11 +208,11 @@ async function extractWithPlaywright(url) {
       "Accept-Language": "en-US,en;q=0.9",
       "Upgrade-Insecure-Requests": "1"
     });
-    await page.goto(url, { waitUntil: "networkidle", timeout: Math.max(60000, TIMEOUT_MS) });
+    await withTimeout(page.goto(url, { waitUntil: "networkidle" }), Math.max(60000, TIMEOUT_MS), "page_goto");
 
     // Try __NEXT_DATA__ first
     try {
-      await page.waitForSelector('script#__NEXT_DATA__', { timeout: 8000 });
+      await withTimeout(page.waitForSelector('script#__NEXT_DATA__', { timeout: 8000 }), 9000, "wait_next_data");
       const nextText = await page.$eval('script#__NEXT_DATA__', el => el.textContent || "");
       if (nextText?.trim()?.startsWith("{")) {
         const json = JSON.parse(nextText);
@@ -205,16 +226,13 @@ async function extractWithPlaywright(url) {
     } catch {}
 
     // Fallback: hydrated DOM
-    try { await page.waitForSelector("[data-message-author-role]", { timeout: 8000 }); } catch {}
+    try { await withTimeout(page.waitForSelector("[data-message-author-role]", { timeout: 8000 }), 9000, "wait_dom"); } catch {}
     const html = await page.content();
     await context.close();
     const dom = extractFromDomHTML(html);
     if (dom) return dom;
 
     return null;
-  } catch (e) {
-    console.error("Playwright error:", e);
-    throw e;
   } finally {
     INFLIGHT--;
   }
@@ -223,17 +241,8 @@ async function extractWithPlaywright(url) {
 /* ---------------- core ingest ---------------- */
 async function ingestCore(targetUrl, debugFlag) {
   if (DRY_RUN) {
-    return {
-      status: 200,
-      body: {
-        dryRun: true,
-        targetUrl,
-        debugFlag,
-        hint: "Set DRY_RUN=0 in Railway env to enable real parsing."
-      }
-    };
+    return { status: 200, body: { dryRun: true, targetUrl, debugFlag, hint: "Set DRY_RUN=0 for real parsing." } };
   }
-
   if (!targetUrl) return { status: 400, body: { error: "url required" } };
   if (!isChatGPTShare(targetUrl)) return { status: 400, body: { error: "only chatgpt share links supported" } };
 
@@ -241,23 +250,29 @@ async function ingestCore(targetUrl, debugFlag) {
   let parsed = null;
   if (!FORCE_PLAYWRIGHT) {
     try {
-      const r = await fetch(targetUrl, {
+      const r = await withTimeout(fetch(targetUrl, {
         headers: {
           "User-Agent": UA,
           "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.9,*/*;q=0.8",
           "Accept-Language": "en-US,en;q=0.9",
           "Upgrade-Insecure-Requests": "1"
         }
-      });
+      }), Math.max(30000, TIMEOUT_MS), "static_fetch");
       if (r.ok) {
         const html = await r.text();
         parsed = extractFromEmbeddedJSON(html) || extractFromDomHTML(html);
       }
-    } catch { /* fall through */ }
+    } catch {}
   }
 
   // 2) Playwright fallback (hydrated)
-  if (!parsed) parsed = await extractWithPlaywright(targetUrl);
+  if (!parsed) {
+    try {
+      parsed = await withTimeout(extractWithPlaywright(targetUrl), Math.max(70000, TIMEOUT_MS + 10000), "playwright");
+    } catch (e) {
+      return { status: 504, body: { error: "playwright_failed", detail: String(e.message || e) } };
+    }
+  }
 
   // 3) Failure diagnostics
   if (!parsed?.turns?.length) {
@@ -266,10 +281,7 @@ async function ingestCore(targetUrl, debugFlag) {
         const r2 = await fetch(targetUrl, { headers: { "User-Agent": UA } });
         const ct = r2.headers.get("content-type") || "";
         const body = await r2.text();
-        return {
-          status: 422,
-          body: { error: "parse_failed", debug: { contentType: ct, bytes: body.length, headSample: body.slice(0, 800) } }
-        };
+        return { status: 422, body: { error: "parse_failed", debug: { contentType: ct, bytes: body.length, headSample: body.slice(0, 800) } } };
       } catch (e) {
         return { status: 422, body: { error: "parse_failed", note: "debug fetch failed", detail: String(e) } };
       }
@@ -295,42 +307,52 @@ app.get("/", (_req, res) => {
   res.type("text/plain").send("AI Chat Export Parser running. Try /healthz or /api/ingest?url=...");
 });
 
-app.get("/healthz", (_req, res) => res.json({ ok: true, ts: nowIso(), dryRun: DRY_RUN }));
+app.get("/healthz", (_req, res) => res.json({ ok: true, ts: nowIso(), dryRun: DRY_RUN, ready: READY }));
 
-// sanity: verify query parsing & JSON-only behavior
+app.get("/diag/playwright", async (_req, res) => {
+  try {
+    const b = await getBrowser();
+    const ctx = await b.newContext();
+    const page = await ctx.newPage();
+    await page.setContent("<html><body>diag</body></html>");
+    await ctx.close();
+    res.json({ ok: true, version: (await b.version?.()) || "unknown" });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+// sanity
 app.get("/api/echo", (req, res) => {
-  res.json({
-    ok: true,
-    urlParam: req.query.url ?? null,
-    srcParam: req.query.src ?? null,
-    debug: req.query.debug ?? null,
-    dryRun: DRY_RUN
-  });
+  res.json({ ok: true, urlParam: req.query.url ?? null, srcParam: req.query.src ?? null, debug: req.query.debug ?? null, dryRun: DRY_RUN });
 });
 
 /** GET /api/ingest?url=... */
 app.get("/api/ingest", async (req, res) => {
   const targetUrl = String(req.query.url || "");
   const debugFlag = String(req.query.debug || "") === "1";
+  if (!READY && FORCE_PLAYWRIGHT) return res.status(503).json({ error: "warming_up" });
   const result = await ingestCore(targetUrl, debugFlag);
   return res.status(result.status).json(result.body);
 });
 
-/** GET /api/ingest2?src=...  (alias avoiding `url=` param) */
+/** GET /api/ingest2?src=... */
 app.get("/api/ingest2", async (req, res) => {
   const targetUrl = String(req.query.src || req.query.u || req.query.link || req.query.target || "");
   const debugFlag = String(req.query.debug || "") === "1";
+  if (!READY && FORCE_PLAYWRIGHT) return res.status(503).json({ error: "warming_up" });
   const result = await ingestCore(targetUrl, debugFlag);
   return res.status(result.status).json(result.body);
 });
 
-/** GET /api/ingest_b64?src_b64=<base64(url)>  (browser-safe GET) */
+/** GET /api/ingest_b64?src_b64=<base64(url)> */
 app.get("/api/ingest_b64", async (req, res) => {
   try {
     const b64 = String(req.query.src_b64 || "");
     if (!b64) return res.status(400).json({ error: "src_b64 required" });
     const targetUrl = Buffer.from(b64, "base64").toString("utf8");
     const debugFlag = String(req.query.debug || "") === "1";
+    if (!READY && FORCE_PLAYWRIGHT) return res.status(503).json({ error: "warming_up" });
     const result = await ingestCore(targetUrl, debugFlag);
     return res.status(result.status).json(result.body);
   } catch (e) {
@@ -338,28 +360,23 @@ app.get("/api/ingest_b64", async (req, res) => {
   }
 });
 
-/** POST /api/ingest  { "url": "..." }  (best for clients; no query follow issues) */
+/** POST /api/ingest  { "url": "..." } */
 app.post("/api/ingest", async (req, res) => {
   const targetUrl = String((req.body && (req.body.url || req.body.src)) || "");
   const debugFlag = Boolean(req.body && (req.body.debug === 1 || req.body.debug === true));
+  if (!READY && FORCE_PLAYWRIGHT) return res.status(503).json({ error: "warming_up" });
   const result = await ingestCore(targetUrl, debugFlag);
   return res.status(result.status).json(result.body);
 });
 
-/* --------- PDF endpoint (keeps PDF content-type) --------- */
+/* --------- PDF endpoint --------- */
 app.post("/api/pdf", async (req, res) => {
   try {
     const { title, turns } = req.body || {};
-    if (!title || !Array.isArray(turns)) {
-      return res.status(400).json({ error: "title and turns required" });
-    }
+    if (!title || !Array.isArray(turns)) return res.status(400).json({ error: "title and turns required" });
 
-    const escapeHtml = s =>
-      String(s).replace(/[&<>"']/g, m => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m]));
-    const formatRich = text =>
-      String(text)
-        .replace(/```([\s\S]*?)```/g, (_m, code) => `<pre><code>${escapeHtml(code)}</code></pre>`)
-        .replace(/\n/g, "<br/>");
+    const escapeHtml = s => String(s).replace(/[&<>"']/g, m => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m]));
+    const formatRich = text => String(text).replace(/```([\s\S]*?)```/g, (_m, code) => `<pre><code>${escapeHtml(code)}</code></pre>`).replace(/\n/g, "<br/>");
     const slug = s => (s || "conversation").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
 
     const html = `<!doctype html><html><head><meta charset="utf-8"><style>
@@ -373,12 +390,12 @@ pre, code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 
 ${turns.map(t => `<div class="turn"><div class="role">${escapeHtml(t.role)}</div><div class="bubble">${formatRich(String(t.content||""))}</div></div>`).join("")}
 </body></html>`;
 
-    const browser = await getBrowser();
-    const context = await browser.newContext();
-    const page = await context.newPage();
+    const b = await getBrowser();
+    const ctx = await b.newContext();
+    const page = await ctx.newPage();
     await page.setContent(html, { waitUntil: "load" });
     const pdf = await page.pdf({ format: "A4", printBackground: true });
-    await context.close();
+    await ctx.close();
 
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", `attachment; filename="${slug(title)}.pdf"`);
@@ -388,5 +405,6 @@ ${turns.map(t => `<div class="turn"><div class="role">${escapeHtml(t.role)}</div
   }
 });
 
-/* ---------------- start ---------------- */
-app.listen(PORT, () => console.log(`🚀 AI Chat Export Parser listening on :${PORT} (DRY_RUN=${DRY_RUN ? "1" : "0"}, CONCURRENCY=${MAX_CONCURRENCY})`));
+/* ---------------- start + warmup ---------------- */
+app.listen(PORT, () => console.log(`🚀 Parser listening on :${PORT} (DRY_RUN=${DRY_RUN?"1":"0"}, CONCURRENCY=${MAX_CONCURRENCY})`));
+warmup();
